@@ -315,7 +315,9 @@ GROQ_API_KEY=your_api_key_here
 Add screenshots of the application here:
 
 ```markdown
-![Corvus Chess Coach](./Screenshot.png)
+![Corvus Chess Coach](screenshots/corvus-main.png)
+
+![AI Chess Explanation](screenshots/ai-explanation2.png)
 ```
 
 ## 🛣️ Future Improvements
