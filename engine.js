@@ -15,6 +15,15 @@ class UciEngine {
   constructor(enginePath) {
     this.enginePath = enginePath;
     this.process = null;
+    // Every analyze() call chains onto this promise instead of running
+    // immediately. That guarantees only one "position ... / go ..." pair
+    // is ever in flight against the engine's stdin/stdout at a time — if
+    // two requests arrive close together (a double-click, a page reload
+    // that leaves a stale request in flight, etc.) the second one simply
+    // waits its turn instead of interleaving with the first and corrupting
+    // both parses, which is what caused the "stuck until server restart"
+    // hang.
+    this.queue = Promise.resolve();
   }
 
   start() {
@@ -40,12 +49,24 @@ class UciEngine {
   /**
    * Sends a FEN position to the engine and asks it to think for the given
    * time budget. Resolves with the parsed evaluation once "bestmove" arrives.
+   * Safe to call concurrently — requests are queued and run one at a time.
    *
    * @param {string} fen
    * @param {number} movetimeMs - how long the engine should think
    * @returns {Promise<{bestMove: string, scoreCp: number, depth: number, nodes: number}>}
    */
   analyze(fen, movetimeMs = 1000) {
+    // Chain this request onto the queue. `.catch(() => {})` on the queue
+    // itself stops one failed request from poisoning the chain for every
+    // request queued after it — each caller still sees its own real
+    // resolve/reject via the returned promise below.
+    const run = () => this._runAnalyze(fen, movetimeMs);
+    const result = this.queue.then(run, run);
+    this.queue = result.catch(() => {});
+    return result;
+  }
+
+  _runAnalyze(fen, movetimeMs) {
     return new Promise((resolve, reject) => {
       if (!this.process) {
         reject(new Error('Engine not started — call start() first.'));
@@ -54,6 +75,20 @@ class UciEngine {
 
       let buffer = '';
       let lastInfo = { scoreCp: 0, depth: 0, nodes: 0 };
+      let settled = false;
+
+      // Safety net: even a well-behaved engine call should never take
+      // dramatically longer than its own think budget. If it does — a
+      // hung process, a malformed FEN the engine chokes on, whatever —
+      // fail loudly instead of hanging the request (and the queue behind
+      // it) forever.
+      const timeoutMs = movetimeMs + 5000;
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        this.process.stdout.off('data', onData);
+        reject(new Error(`Engine did not respond within ${timeoutMs}ms.`));
+      }, timeoutMs);
 
       const onData = (chunk) => {
         buffer += chunk;
@@ -65,6 +100,9 @@ class UciEngine {
           if (line.startsWith('info')) {
             lastInfo = parseInfoLine(line);
           } else if (line.startsWith('bestmove')) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
             this.process.stdout.off('data', onData);
             const bestMove = line.split(' ')[1];
             resolve({ bestMove, ...lastInfo });
