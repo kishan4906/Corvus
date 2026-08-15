@@ -7,7 +7,9 @@
 const express = require('express');
 const cors = require('cors');
 const { UciEngine } = require('./engine.js');
-const { explainPosition } = require('./coach.js');
+const { explainPosition, explainGame } = require('./coach.js');
+const { classifyMove, computeAccuracy, normalizeScore } = require('./classify.js');
+const { identifyOpening } = require('./openings.js');
 
 const PORT = process.env.PORT || 3001;
 const ENGINE_PATH = process.platform === 'win32' ? './kestrel.exe' : './kestrel';
@@ -55,6 +57,172 @@ app.post('/api/analyze', async (req, res) => {
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', engineRunning: !!engine.process });
+});
+
+// POST /api/analyze-game
+// Body: { positions: [{ moveNumber, color, san, fen }, ...], quickMovetimeMs?, deepMovetimeMs? }
+//   positions[0] MUST be the starting position, with san/color/moveNumber
+//   left null/undefined — it's the "before any moves" baseline eval.
+//   Every entry after that is the position AFTER one ply.
+//
+// Streams newline-delimited JSON as it works, so the frontend can show
+// live progress instead of blocking on one giant response:
+//   {"type":"progress","phase":"quick"|"deep","index":N,"total":M}
+//   {"type":"done","report":{...}}
+//   {"type":"error","error":"..."}
+//
+// Two-pass strategy (see engine.js/classify.js for the "why"): every ply
+// gets a fast shallow pass first to build the eval curve and classify
+// moves cheaply; only the flagged Mistake/Blunder positions then get a
+// slower, deeper re-analysis. This keeps a full game's analysis time
+// roughly linear in game length instead of exploding at max depth for
+// every single position.
+app.post('/api/analyze-game', async (req, res) => {
+  const { positions, quickMovetimeMs = 250, deepMovetimeMs = 1000 } = req.body;
+
+  if (!Array.isArray(positions) || positions.length < 2) {
+    res.status(400).json({ error: 'Request body must include a "positions" array with at least a start position plus one move.' });
+    return;
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'application/x-ndjson',
+    'Cache-Control': 'no-cache',
+    'Transfer-Encoding': 'chunked',
+  });
+  const send = (obj) => res.write(JSON.stringify(obj) + '\n');
+
+  try {
+    const total = positions.length - 1; // number of actual half-moves
+    const evals = new Array(positions.length);
+    const bestMoves = new Array(positions.length);
+
+    // Pass 1: quick eval at every ply, including the starting position
+    // (index 0), which serves as the baseline the first move is judged against.
+    for (let i = 0; i < positions.length; i++) {
+      const result = await engine.analyze(positions[i].fen, quickMovetimeMs);
+      evals[i] = normalizeScore(result.scoreCp);
+      bestMoves[i] = result.bestMove;
+      if (i > 0) {
+        send({ type: 'progress', phase: 'quick', index: i, total });
+      }
+    }
+
+    // Classify every move by comparing the eval right before it was
+    // played to the eval right after.
+    const moveResults = [];
+    for (let i = 1; i < positions.length; i++) {
+      const { moveNumber, color, san } = positions[i];
+      const { label, centipawnLoss } = classifyMove(evals[i - 1], evals[i], color);
+      moveResults.push({
+        ply: i,
+        moveNumber,
+        color,
+        san,
+        evalBefore: evals[i - 1],
+        evalAfter: evals[i],
+        bestMoveBefore: bestMoves[i - 1],
+        label,
+        centipawnLoss,
+      });
+    }
+
+    // Pass 2: deeper re-analysis, but only for the moves that pass 1
+    // flagged as Mistake or Blunder — this is what keeps the total
+    // analysis time from exploding on a long game.
+    const criticalMoves = moveResults.filter((m) => m.label === 'Mistake' || m.label === 'Blunder');
+    for (let i = 0; i < criticalMoves.length; i++) {
+      const m = criticalMoves[i];
+      const posBeforeMove = positions[m.ply - 1].fen;
+      const deep = await engine.analyze(posBeforeMove, deepMovetimeMs);
+      m.deepBestMove = deep.bestMove;
+      m.deepEvalBefore = normalizeScore(deep.scoreCp);
+      send({ type: 'progress', phase: 'deep', index: i + 1, total: criticalMoves.length });
+    }
+
+    // Aggregate per-color stats.
+    const colorMoves = (color) => moveResults.filter((m) => m.color === color);
+    const countsFor = (color) => {
+      const counts = { Best: 0, Good: 0, Inaccuracy: 0, Mistake: 0, Blunder: 0 };
+      colorMoves(color).forEach((m) => counts[m.label]++);
+      return counts;
+    };
+
+    const accuracy = {
+      white: computeAccuracy(colorMoves('w').map((m) => m.centipawnLoss)),
+      black: computeAccuracy(colorMoves('b').map((m) => m.centipawnLoss)),
+    };
+    const counts = { white: countsFor('w'), black: countsFor('b') };
+
+    // Critical moment = the single largest eval swing among flagged moves.
+    // Best move of the game = a "Best"-labeled move played in the most
+    // pressured position available (largest |eval| beforehand) — a simple,
+    // defensible stand-in for "the move that mattered most and was found".
+    let criticalMoment = null;
+    let biggestBlunder = null;
+    let bestMoveOfGame = null;
+
+    for (const m of moveResults) {
+      if (m.label === 'Mistake' || m.label === 'Blunder') {
+        if (!criticalMoment || m.centipawnLoss > criticalMoment.centipawnLoss) criticalMoment = m;
+      }
+      if (m.label === 'Blunder') {
+        if (!biggestBlunder || m.centipawnLoss > biggestBlunder.centipawnLoss) biggestBlunder = m;
+      }
+      if (m.label === 'Best') {
+        if (!bestMoveOfGame || Math.abs(m.evalBefore) > Math.abs(bestMoveOfGame.evalBefore)) bestMoveOfGame = m;
+      }
+    }
+
+    const opening = identifyOpening(positions.slice(1).map((p) => p.san));
+
+    const toPublic = (m) =>
+      m && {
+        moveNumber: m.moveNumber,
+        color: m.color,
+        san: m.san,
+        evalBefore: m.evalBefore,
+        evalAfter: m.evalAfter,
+        centipawnLoss: m.centipawnLoss,
+      };
+
+    const report = {
+      accuracy,
+      counts,
+      opening,
+      criticalMoment: toPublic(criticalMoment),
+      biggestBlunder: toPublic(biggestBlunder),
+      bestMoveOfGame: toPublic(bestMoveOfGame),
+      evalGraph: evals, // White-perspective eval per ply, index 0 = starting position
+      moves: moveResults.map((m) => ({
+        moveNumber: m.moveNumber,
+        color: m.color,
+        san: m.san,
+        label: m.label,
+        centipawnLoss: m.centipawnLoss,
+        evalAfter: m.evalAfter,
+        fen: positions[m.ply].fen,
+      })),
+    };
+
+    send({ type: 'progress', phase: 'summary', index: total, total });
+
+    if (GROQ_API_KEY) {
+      try {
+        report.summary = await explainGame(report, GROQ_API_KEY);
+      } catch (err) {
+        report.summaryError = err.message;
+      }
+    } else {
+      report.summaryError = 'GROQ_API_KEY not set on the server — no summary generated.';
+    }
+
+    send({ type: 'done', report });
+  } catch (err) {
+    send({ type: 'error', error: err.message });
+  } finally {
+    res.end();
+  }
 });
 
 app.listen(PORT, () => {

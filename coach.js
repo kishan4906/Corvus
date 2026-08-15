@@ -11,14 +11,14 @@ const GROQ_MODEL = 'llama-3.3-70b-versatile'; // free-tier, strong general model
 /**
  * @param {object} analysis - output of UciEngine.analyze()
  * @param {string} analysis.bestMove - e.g. "d1d5"
- * @param {number} analysis.scoreCp - centipawn eval, from side-to-move's perspective
+ * @param {number} analysis.scoreCp - White-perspective centipawn eval
  * @param {string} fen - the position being explained
  * @param {string} apiKey - Groq API key (from console.groq.com)
  * @returns {Promise<string>} plain-English explanation
  */
 async function explainPosition({ bestMove, scoreCp, fen, apiKey }) {
   const sideToMove = fen.split(' ')[1] === 'w' ? 'White' : 'Black';
-  const evalPawns = (scoreCp / 100).toFixed(2);
+  const evalPawns = (scoreCp / 100).toFixed(2); // already White-perspective, no conversion needed
 
   const prompt = buildPrompt({ fen, sideToMove, bestMove, evalPawns });
 
@@ -64,4 +64,73 @@ function buildPrompt({ fen, sideToMove, bestMove, evalPawns }) {
   ].join('\n');
 }
 
-module.exports = { explainPosition };
+/**
+ * Summarizes an entire analyzed game in plain English — one LLM call for
+ * the whole game, not one per move, since a per-move explanation for
+ * every ply would be slow and expensive for no real benefit (most moves
+ * in a real game are unremarkable).
+ *
+ * @param {object} report - aggregated stats from the game analysis
+ * @param {string} apiKey
+ * @returns {Promise<string>}
+ */
+async function explainGame(report, apiKey) {
+  const prompt = buildGameSummaryPrompt(report);
+
+  const response = await fetch(GROQ_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are a chess coach writing a short post-game summary for an intermediate club player. ' +
+            'Write 4-6 sentences: overall impression, what went well, what to work on, and reference the ' +
+            'critical moment by move number and the eval swing. Be direct and concrete, not generic praise.',
+        },
+        { role: 'user', content: prompt },
+      ],
+      temperature: 0.4,
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Groq API error ${response.status}: ${errText}`);
+  }
+
+  const data = await response.json();
+  return data.choices[0].message.content.trim();
+}
+
+function buildGameSummaryPrompt(report) {
+  const lines = [
+    `White accuracy: ${report.accuracy.white}%`,
+    `Black accuracy: ${report.accuracy.black}%`,
+    `Opening: ${report.opening}`,
+    `Move counts (White): ${JSON.stringify(report.counts.white)}`,
+    `Move counts (Black): ${JSON.stringify(report.counts.black)}`,
+  ];
+
+  if (report.criticalMoment) {
+    const c = report.criticalMoment;
+    lines.push(
+      `Critical moment: move ${c.moveNumber} (${c.color === 'w' ? 'White' : 'Black'}) played ${c.san}, ` +
+        `eval swung from ${(c.evalBefore / 100).toFixed(2)} to ${(c.evalAfter / 100).toFixed(2)} (White-perspective pawns)`
+    );
+  }
+  if (report.biggestBlunder) {
+    const b = report.biggestBlunder;
+    lines.push(`Biggest blunder: move ${b.moveNumber} (${b.color === 'w' ? 'White' : 'Black'}) ${b.san}`);
+  }
+
+  lines.push('', 'Write the post-game summary now.');
+  return lines.join('\n');
+}
+
+module.exports = { explainPosition, explainGame };

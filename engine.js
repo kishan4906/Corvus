@@ -54,6 +54,8 @@ class UciEngine {
    * @param {string} fen
    * @param {number} movetimeMs - how long the engine should think
    * @returns {Promise<{bestMove: string, scoreCp: number, depth: number, nodes: number}>}
+   *   scoreCp is always White-perspective (positive favors White), regardless
+   *   of whose turn it is in `fen` — NOT the raw UCI side-to-move-relative value.
    */
   analyze(fen, movetimeMs = 1000) {
     // Chain this request onto the queue. `.catch(() => {})` on the queue
@@ -77,11 +79,6 @@ class UciEngine {
       let lastInfo = { scoreCp: 0, depth: 0, nodes: 0 };
       let settled = false;
 
-      // Safety net: even a well-behaved engine call should never take
-      // dramatically longer than its own think budget. If it does — a
-      // hung process, a malformed FEN the engine chokes on, whatever —
-      // fail loudly instead of hanging the request (and the queue behind
-      // it) forever.
       const timeoutMs = movetimeMs + 5000;
       const timeout = setTimeout(() => {
         if (settled) return;
@@ -93,10 +90,10 @@ class UciEngine {
       const onData = (chunk) => {
         buffer += chunk;
         const lines = buffer.split('\n');
-        buffer = lines.pop(); // keep any incomplete trailing line for next chunk
+        buffer = lines.pop();
 
         for (const rawLine of lines) {
-          const line = rawLine.trim(); // strips the trailing \r Windows adds after \n splits
+          const line = rawLine.trim();
           if (line.startsWith('info')) {
             lastInfo = parseInfoLine(line);
           } else if (line.startsWith('bestmove')) {
@@ -105,7 +102,19 @@ class UciEngine {
             clearTimeout(timeout);
             this.process.stdout.off('data', onData);
             const bestMove = line.split(' ')[1];
-            resolve({ bestMove, ...lastInfo });
+
+            // UCI reports "score cp" relative to whoever is to move in
+            // the position we just sent — standard for the protocol, but
+            // inconvenient for us: every caller in this app (the eval
+            // gauge, the game-analysis eval graph, move classification)
+            // wants a single consistent White-perspective number so
+            // positions can be compared across a whole game regardless
+            // of whose turn it was. Convert once, here, so nobody else
+            // has to remember to.
+            const sideToMove = fen.split(' ')[1]; // 'w' or 'b'
+            const whiteScoreCp = sideToMove === 'b' ? -lastInfo.scoreCp : lastInfo.scoreCp;
+
+            resolve({ bestMove, ...lastInfo, scoreCp: whiteScoreCp });
             return;
           }
         }
