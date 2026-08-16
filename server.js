@@ -26,10 +26,16 @@ const engine = new UciEngine(ENGINE_PATH);
 engine.start();
 
 // POST /api/analyze
-// Body: { fen: string, movetimeMs?: number, explain?: boolean }
-// Returns: { bestMove, scoreCp, depth, nodes, explanation? }
+// Body: { fen: string, fenBefore?: string, movetimeMs?: number, explain?: boolean }
+//   fenBefore is OPTIONAL — the position immediately before the move being
+//   judged. When present, the response also includes move-quality fields
+//   (scoreBefore, scoreAfter, evaluationLoss, classification). When absent,
+//   behavior is unchanged from before this feature existed: just an
+//   analysis of `fen` on its own.
+// Returns: { bestMove, scoreCp, depth, nodes, explanation?,
+//            scoreBefore?, scoreAfter?, evaluationLoss?, classification? }
 app.post('/api/analyze', async (req, res) => {
-  const { fen, movetimeMs = 800, explain = true } = req.body;
+  const { fen, fenBefore, movetimeMs = 800, explain = true } = req.body;
 
   if (!fen || typeof fen !== 'string') {
     res.status(400).json({ error: 'Request body must include a "fen" string.' });
@@ -40,12 +46,47 @@ app.post('/api/analyze', async (req, res) => {
     const analysis = await engine.analyze(fen, movetimeMs);
     const result = { ...analysis };
 
+    let classification = null;
+    if (fenBefore && typeof fenBefore === 'string') {
+      // Two extra engine calls to bracket the move: eval right before it
+      // was played, and eval right after (which we already have from
+      // `analysis` above — `fen` IS the after-move position). Both are
+      // already White-perspective centipawns (see engine.js), and already
+      // normalized against forced-mate scores blowing up the numbers.
+      const before = await engine.analyze(fenBefore, movetimeMs);
+      const scoreBefore = normalizeScore(before.scoreCp);
+      const scoreAfter = normalizeScore(analysis.scoreCp);
+
+      // Whoever moved is whoever was to move in the BEFORE position —
+      // that's the player classify.js needs, not the side to move now.
+      const mover = fenBefore.split(' ')[1] === 'b' ? 'b' : 'w';
+      const { label, centipawnLoss } = classifyMove(scoreBefore, scoreAfter, mover);
+
+      classification = { scoreBefore, scoreAfter, evaluationLoss: centipawnLoss, classification: label };
+      Object.assign(result, classification);
+
+      // Once we're classifying a move, "bestMove" should mean "what the
+      // user should have played instead" — that's the engine's top choice
+      // from the BEFORE position. `analysis.bestMove` (from the AFTER
+      // position) is actually the opponent's best reply now, which isn't
+      // what "Kestrel preferred X instead" is supposed to mean. Override
+      // it here rather than exposing two confusingly-similar fields.
+      result.bestMove = before.bestMove;
+    }
+
     if (explain) {
       if (!GROQ_API_KEY) {
         result.explanation = null;
         result.explanationError = 'GROQ_API_KEY not set on the server — analysis only, no explanation.';
       } else {
-        result.explanation = await explainPosition({ ...analysis, fen, apiKey: GROQ_API_KEY });
+        result.explanation = await explainPosition({
+          bestMove: result.bestMove, // may be before.bestMove if classifying — see above
+          scoreCp: analysis.scoreCp,
+          fen,
+          apiKey: GROQ_API_KEY,
+          classification: classification?.classification,
+          evaluationLoss: classification?.evaluationLoss,
+        });
       }
     }
 

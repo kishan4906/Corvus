@@ -14,13 +14,16 @@ const GROQ_MODEL = 'llama-3.3-70b-versatile'; // free-tier, strong general model
  * @param {number} analysis.scoreCp - White-perspective centipawn eval
  * @param {string} fen - the position being explained
  * @param {string} apiKey - Groq API key (from console.groq.com)
+ * @param {string} [classification] - optional move-quality label (Best/Good/Inaccuracy/Mistake/Blunder),
+ *   from comparing this position to the one before the user's move
+ * @param {number} [evaluationLoss] - optional centipawn loss for that move
  * @returns {Promise<string>} plain-English explanation
  */
-async function explainPosition({ bestMove, scoreCp, fen, apiKey }) {
+async function explainPosition({ bestMove, scoreCp, fen, apiKey, classification, evaluationLoss }) {
   const sideToMove = fen.split(' ')[1] === 'w' ? 'White' : 'Black';
   const evalPawns = (scoreCp / 100).toFixed(2); // already White-perspective, no conversion needed
 
-  const prompt = buildPrompt({ fen, sideToMove, bestMove, evalPawns });
+  const prompt = buildPrompt({ fen, sideToMove, bestMove, evalPawns, classification, evaluationLoss });
 
   const response = await fetch(GROQ_API_URL, {
     method: 'POST',
@@ -36,7 +39,10 @@ async function explainPosition({ bestMove, scoreCp, fen, apiKey }) {
           content:
             'You are a chess coach explaining engine analysis to an intermediate club player. ' +
             'Be concise (3-5 sentences), concrete, and avoid vague filler like "this is a good move" ' +
-            'without saying why. Reference actual squares and pieces.',
+            'without saying why. Reference actual squares and pieces. ' +
+            'If a move classification (Best/Good/Inaccuracy/Mistake/Blunder) and evaluation loss are ' +
+            'given, open by naming the classification and the approximate pawns lost, then explain why ' +
+            'the position changed and what the better move was, in that order.',
         },
         { role: 'user', content: prompt },
       ],
@@ -53,15 +59,27 @@ async function explainPosition({ bestMove, scoreCp, fen, apiKey }) {
   return data.choices[0].message.content.trim();
 }
 
-function buildPrompt({ fen, sideToMove, bestMove, evalPawns }) {
-  return [
+function buildPrompt({ fen, sideToMove, bestMove, evalPawns, classification, evaluationLoss }) {
+  const lines = [
     `Position (FEN): ${fen}`,
     `Side to move: ${sideToMove}`,
     `Engine's recommended move (UCI notation, e.g. e2e4 means the piece on e2 moves to e4): ${bestMove}`,
     `Engine evaluation: ${evalPawns} (positive favors White, negative favors Black, in units of pawns)`,
-    '',
-    'Explain why this is a strong move in this position, and briefly what the evaluation number means for whoever is winning.',
-  ].join('\n');
+  ];
+
+  if (classification) {
+    lines.push(
+      '',
+      `The user just played a move. Kestrel classifies it as: ${classification}`,
+      `Evaluation lost by that move: ${(evaluationLoss / 100).toFixed(2)} pawns`,
+      '',
+      'Explain the classification and evaluation loss first, then why the engine\'s recommended move is better.'
+    );
+  } else {
+    lines.push('', 'Explain why this is a strong move in this position, and briefly what the evaluation number means for whoever is winning.');
+  }
+
+  return lines.join('\n');
 }
 
 /**
