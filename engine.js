@@ -58,17 +58,43 @@ class UciEngine {
    *   of whose turn it is in `fen` — NOT the raw UCI side-to-move-relative value.
    */
   analyze(fen, movetimeMs = 1000) {
+    return this._enqueue(fen, `go movetime ${movetimeMs}`, movetimeMs + 5000);
+  }
+
+  /**
+   * Same as analyze(), but searches to a FIXED depth instead of a time
+   * budget ("go depth N"). Use this when you need a guaranteed minimum
+   * amount of look-ahead regardless of hardware speed — in particular,
+   * a too-shallow time-boxed search can misjudge the position right
+   * after a capture, because it never looks far enough ahead to see the
+   * recapture coming (no quiescence search in this engine — see
+   * classify.js / server.js comments on why the "quick pass" for game
+   * analysis switched to this). No time budget here means worst-case
+   * runtime is bounded by depth alone, so keep depth modest for bulk use.
+   *
+   * @param {string} fen
+   * @param {number} depth - plies to search, fully (not time-limited)
+   */
+  analyzeToDepth(fen, depth = 4) {
+    // Untimed searches have no natural upper bound the way a movetime
+    // search does, so give this a more generous safety window — a
+    // pathological branching-factor position at depth 5+ can genuinely
+    // take a few seconds, and we'd rather wait than falsely time out.
+    return this._enqueue(fen, `go depth ${depth}`, 15000);
+  }
+
+  _enqueue(fen, goCommand, timeoutMs) {
     // Chain this request onto the queue. `.catch(() => {})` on the queue
     // itself stops one failed request from poisoning the chain for every
     // request queued after it — each caller still sees its own real
     // resolve/reject via the returned promise below.
-    const run = () => this._runAnalyze(fen, movetimeMs);
+    const run = () => this._runAnalyze(fen, goCommand, timeoutMs);
     const result = this.queue.then(run, run);
     this.queue = result.catch(() => {});
     return result;
   }
 
-  _runAnalyze(fen, movetimeMs) {
+  _runAnalyze(fen, goCommand, timeoutMs) {
     return new Promise((resolve, reject) => {
       if (!this.process) {
         reject(new Error('Engine not started — call start() first.'));
@@ -79,7 +105,6 @@ class UciEngine {
       let lastInfo = { scoreCp: 0, depth: 0, nodes: 0 };
       let settled = false;
 
-      const timeoutMs = movetimeMs + 5000;
       const timeout = setTimeout(() => {
         if (settled) return;
         settled = true;
@@ -122,7 +147,7 @@ class UciEngine {
 
       this.process.stdout.on('data', onData);
       this.process.stdin.write(`position fen ${fen}\n`);
-      this.process.stdin.write(`go movetime ${movetimeMs}\n`);
+      this.process.stdin.write(`${goCommand}\n`);
     });
   }
 }

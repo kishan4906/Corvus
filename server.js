@@ -26,16 +26,21 @@ const engine = new UciEngine(ENGINE_PATH);
 engine.start();
 
 // POST /api/analyze
-// Body: { fen: string, fenBefore?: string, movetimeMs?: number, explain?: boolean }
+// Body: { fen: string, fenBefore?: string, playedMove?: string, movetimeMs?: number, explain?: boolean }
 //   fenBefore is OPTIONAL — the position immediately before the move being
 //   judged. When present, the response also includes move-quality fields
-//   (scoreBefore, scoreAfter, evaluationLoss, classification). When absent,
-//   behavior is unchanged from before this feature existed: just an
-//   analysis of `fen` on its own.
+//   (scoreBefore, scoreAfter, evaluationLoss, classification, plus the
+//   spec-named aliases playedMoveScore/bestMoveScore/evaluationDifference).
+//   playedMove is an OPTIONAL SAN string (e.g. "Qxd5") — the frontend
+//   already knows this from chess.js when the move was made; we just
+//   echo it back so the response is a self-contained comparison object.
+//   When fenBefore is absent, behavior is unchanged: just an analysis
+//   of `fen` on its own.
 // Returns: { bestMove, scoreCp, depth, nodes, explanation?,
-//            scoreBefore?, scoreAfter?, evaluationLoss?, classification? }
+//            scoreBefore?, scoreAfter?, evaluationLoss?, classification?,
+//            playedMove?, playedMoveScore?, bestMoveScore?, evaluationDifference? }
 app.post('/api/analyze', async (req, res) => {
-  const { fen, fenBefore, movetimeMs = 800, explain = true } = req.body;
+  const { fen, fenBefore, playedMove, movetimeMs = 800, explain = true } = req.body;
 
   if (!fen || typeof fen !== 'string') {
     res.status(400).json({ error: 'Request body must include a "fen" string.' });
@@ -53,6 +58,15 @@ app.post('/api/analyze', async (req, res) => {
       // `analysis` above — `fen` IS the after-move position). Both are
       // already White-perspective centipawns (see engine.js), and already
       // normalized against forced-mate scores blowing up the numbers.
+      //
+      // Note on `before.scoreCp`: this is the root search's OWN reported
+      // score for the before-position — which, by how minimax works, IS
+      // the evaluation of the position that results from playing the
+      // engine's own best move (the root score is literally derived from
+      // searching every candidate move and reporting the best child's
+      // score). So this single call already gives us both "eval of this
+      // position" AND "eval after Kestrel's recommended move" — no third
+      // engine call needed to evaluate "what if the best move were played".
       const before = await engine.analyze(fenBefore, movetimeMs);
       const scoreBefore = normalizeScore(before.scoreCp);
       const scoreAfter = normalizeScore(analysis.scoreCp);
@@ -72,6 +86,16 @@ app.post('/api/analyze', async (req, res) => {
       // what "Kestrel preferred X instead" is supposed to mean. Override
       // it here rather than exposing two confusingly-similar fields.
       result.bestMove = before.bestMove;
+
+      // Spec-named aliases for the move-comparison feature — same numbers
+      // as scoreAfter/scoreBefore/evaluationLoss above, just named to
+      // match "your move vs Kestrel's move" framing directly. Kept as
+      // additions, not replacements, so nothing already reading
+      // scoreBefore/scoreAfter/evaluationLoss/classification breaks.
+      result.playedMove = typeof playedMove === 'string' ? playedMove : undefined;
+      result.playedMoveScore = scoreAfter;
+      result.bestMoveScore = scoreBefore;
+      result.evaluationDifference = centipawnLoss;
     }
 
     if (explain) {
@@ -86,6 +110,7 @@ app.post('/api/analyze', async (req, res) => {
           apiKey: GROQ_API_KEY,
           classification: classification?.classification,
           evaluationLoss: classification?.evaluationLoss,
+          playedMove: result.playedMove,
         });
       }
     }
@@ -101,7 +126,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // POST /api/analyze-game
-// Body: { positions: [{ moveNumber, color, san, fen }, ...], quickMovetimeMs?, deepMovetimeMs? }
+// Body: { positions: [{ moveNumber, color, san, fen }, ...], quickDepth?, deepMovetimeMs? }
 //   positions[0] MUST be the starting position, with san/color/moveNumber
 //   left null/undefined — it's the "before any moves" baseline eval.
 //   Every entry after that is the position AFTER one ply.
@@ -113,13 +138,14 @@ app.get('/api/health', (req, res) => {
 //   {"type":"error","error":"..."}
 //
 // Two-pass strategy (see engine.js/classify.js for the "why"): every ply
-// gets a fast shallow pass first to build the eval curve and classify
-// moves cheaply; only the flagged Mistake/Blunder positions then get a
-// slower, deeper re-analysis. This keeps a full game's analysis time
+// gets a fixed-DEPTH first pass (not time-boxed — see analyzeToDepth's
+// docs for why depth matters more than time here) to build the eval curve
+// and classify moves; only the flagged Mistake/Blunder positions then get
+// a slower, deeper re-analysis. This keeps a full game's analysis time
 // roughly linear in game length instead of exploding at max depth for
 // every single position.
 app.post('/api/analyze-game', async (req, res) => {
-  const { positions, quickMovetimeMs = 250, deepMovetimeMs = 1000 } = req.body;
+  const { positions, quickDepth = 4, deepMovetimeMs = 1000 } = req.body;
 
   if (!Array.isArray(positions) || positions.length < 2) {
     res.status(400).json({ error: 'Request body must include a "positions" array with at least a start position plus one move.' });
@@ -138,10 +164,17 @@ app.post('/api/analyze-game', async (req, res) => {
     const evals = new Array(positions.length);
     const bestMoves = new Array(positions.length);
 
-    // Pass 1: quick eval at every ply, including the starting position
-    // (index 0), which serves as the baseline the first move is judged against.
+    // Pass 1: fixed-depth eval at every ply, including the starting position
+    // (index 0), which serves as the baseline the first move is judged
+    // against. Fixed depth (not a time budget) is deliberate — Kestrel has
+    // no quiescence search, so a too-shallow search can misjudge the
+    // position right after a capture (it doesn't look far enough ahead to
+    // see the recapture), producing wild eval swings that aren't real
+    // mistakes. A guaranteed few plies of look-ahead sees the recapture
+    // within the search itself, keeping ordinary trades from being
+    // misclassified as blunders.
     for (let i = 0; i < positions.length; i++) {
-      const result = await engine.analyze(positions[i].fen, quickMovetimeMs);
+      const result = await engine.analyzeToDepth(positions[i].fen, quickDepth);
       evals[i] = normalizeScore(result.scoreCp);
       bestMoves[i] = result.bestMove;
       if (i > 0) {

@@ -17,13 +17,15 @@ const GROQ_MODEL = 'llama-3.3-70b-versatile'; // free-tier, strong general model
  * @param {string} [classification] - optional move-quality label (Best/Good/Inaccuracy/Mistake/Blunder),
  *   from comparing this position to the one before the user's move
  * @param {number} [evaluationLoss] - optional centipawn loss for that move
+ * @param {string} [playedMove] - optional SAN of the move the user actually played (e.g. "Qxd5"),
+ *   so the explanation can name and contrast BOTH moves, not just narrate the recommended one
  * @returns {Promise<string>} plain-English explanation
  */
-async function explainPosition({ bestMove, scoreCp, fen, apiKey, classification, evaluationLoss }) {
+async function explainPosition({ bestMove, scoreCp, fen, apiKey, classification, evaluationLoss, playedMove }) {
   const sideToMove = fen.split(' ')[1] === 'w' ? 'White' : 'Black';
   const evalPawns = (scoreCp / 100).toFixed(2); // already White-perspective, no conversion needed
 
-  const prompt = buildPrompt({ fen, sideToMove, bestMove, evalPawns, classification, evaluationLoss });
+  const prompt = buildPrompt({ fen, sideToMove, bestMove, evalPawns, classification, evaluationLoss, playedMove });
 
   const response = await fetch(GROQ_API_URL, {
     method: 'POST',
@@ -40,9 +42,12 @@ async function explainPosition({ bestMove, scoreCp, fen, apiKey, classification,
             'You are a chess coach explaining engine analysis to an intermediate club player. ' +
             'Be concise (3-5 sentences), concrete, and avoid vague filler like "this is a good move" ' +
             'without saying why. Reference actual squares and pieces. ' +
-            'If a move classification (Best/Good/Inaccuracy/Mistake/Blunder) and evaluation loss are ' +
-            'given, open by naming the classification and the approximate pawns lost, then explain why ' +
-            'the position changed and what the better move was, in that order.',
+            'If a played move and a recommended move are both given, structure the answer as a direct ' +
+            'comparison: name the recommended move and why it is stronger (what it develops, controls, or ' +
+            'threatens), then name the played move and what it does or fails to do by contrast — the way a ' +
+            'human coach would say "X is stronger because... your Y move does A but allows B." ' +
+            'If only a classification and evaluation loss are given (no move names), open by naming the ' +
+            'classification and approximate pawns lost, then explain why the position changed.',
         },
         { role: 'user', content: prompt },
       ],
@@ -59,7 +64,7 @@ async function explainPosition({ bestMove, scoreCp, fen, apiKey, classification,
   return data.choices[0].message.content.trim();
 }
 
-function buildPrompt({ fen, sideToMove, bestMove, evalPawns, classification, evaluationLoss }) {
+function buildPrompt({ fen, sideToMove, bestMove, evalPawns, classification, evaluationLoss, playedMove }) {
   const lines = [
     `Position (FEN): ${fen}`,
     `Side to move: ${sideToMove}`,
@@ -70,10 +75,14 @@ function buildPrompt({ fen, sideToMove, bestMove, evalPawns, classification, eva
   if (classification) {
     lines.push(
       '',
-      `The user just played a move. Kestrel classifies it as: ${classification}`,
+      playedMove
+        ? `The user played ${playedMove} instead. Kestrel classifies that move as: ${classification}`
+        : `The user just played a move. Kestrel classifies it as: ${classification}`,
       `Evaluation lost by that move: ${(evaluationLoss / 100).toFixed(2)} pawns`,
       '',
-      'Explain the classification and evaluation loss first, then why the engine\'s recommended move is better.'
+      playedMove
+        ? `Compare ${playedMove} (what was played) against the recommended move directly — why is the recommendation stronger, and what does ${playedMove} miss or allow?`
+        : 'Explain the classification and evaluation loss first, then why the engine\'s recommended move is better.'
     );
   } else {
     lines.push('', 'Explain why this is a strong move in this position, and briefly what the evaluation number means for whoever is winning.');
