@@ -74,10 +74,11 @@ app.post('/api/analyze', async (req, res) => {
       // Whoever moved is whoever was to move in the BEFORE position —
       // that's the player classify.js needs, not the side to move now.
       const mover = fenBefore.split(' ')[1] === 'b' ? 'b' : 'w';
-      const { label, centipawnLoss } = classifyMove(scoreBefore, scoreAfter, mover);
+      const { label, centipawnLoss, winProbLoss } = classifyMove(scoreBefore, scoreAfter, mover);
 
       classification = { scoreBefore, scoreAfter, evaluationLoss: centipawnLoss, classification: label };
       Object.assign(result, classification);
+      result.winProbabilityLoss = winProbLoss; // percentage points, 0-100 — what classification is actually decided on
 
       // Once we're classifying a move, "bestMove" should mean "what the
       // user should have played instead" — that's the engine's top choice
@@ -187,7 +188,7 @@ app.post('/api/analyze-game', async (req, res) => {
     const moveResults = [];
     for (let i = 1; i < positions.length; i++) {
       const { moveNumber, color, san } = positions[i];
-      const { label, centipawnLoss } = classifyMove(evals[i - 1], evals[i], color);
+      const { label, centipawnLoss, winProbLoss } = classifyMove(evals[i - 1], evals[i], color);
       moveResults.push({
         ply: i,
         moveNumber,
@@ -198,6 +199,7 @@ app.post('/api/analyze-game', async (req, res) => {
         bestMoveBefore: bestMoves[i - 1],
         label,
         centipawnLoss,
+        winProbLoss,
       });
     }
 
@@ -223,8 +225,8 @@ app.post('/api/analyze-game', async (req, res) => {
     };
 
     const accuracy = {
-      white: computeAccuracy(colorMoves('w').map((m) => m.centipawnLoss)),
-      black: computeAccuracy(colorMoves('b').map((m) => m.centipawnLoss)),
+      white: computeAccuracy(colorMoves('w').map((m) => m.winProbLoss)),
+      black: computeAccuracy(colorMoves('b').map((m) => m.winProbLoss)),
     };
     const counts = { white: countsFor('w'), black: countsFor('b') };
 
@@ -238,10 +240,10 @@ app.post('/api/analyze-game', async (req, res) => {
 
     for (const m of moveResults) {
       if (m.label === 'Mistake' || m.label === 'Blunder') {
-        if (!criticalMoment || m.centipawnLoss > criticalMoment.centipawnLoss) criticalMoment = m;
+        if (!criticalMoment || m.winProbLoss > criticalMoment.winProbLoss) criticalMoment = m;
       }
       if (m.label === 'Blunder') {
-        if (!biggestBlunder || m.centipawnLoss > biggestBlunder.centipawnLoss) biggestBlunder = m;
+        if (!biggestBlunder || m.winProbLoss > biggestBlunder.winProbLoss) biggestBlunder = m;
       }
       if (m.label === 'Best') {
         if (!bestMoveOfGame || Math.abs(m.evalBefore) > Math.abs(bestMoveOfGame.evalBefore)) bestMoveOfGame = m;
@@ -258,6 +260,7 @@ app.post('/api/analyze-game', async (req, res) => {
         evalBefore: m.evalBefore,
         evalAfter: m.evalAfter,
         centipawnLoss: m.centipawnLoss,
+        winProbLoss: m.winProbLoss,
       };
 
     const report = {
@@ -274,6 +277,7 @@ app.post('/api/analyze-game', async (req, res) => {
         san: m.san,
         label: m.label,
         centipawnLoss: m.centipawnLoss,
+        winProbLoss: m.winProbLoss,
         evalAfter: m.evalAfter,
         fen: positions[m.ply].fen,
       })),
